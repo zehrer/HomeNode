@@ -2,7 +2,7 @@
 # Project:    Infinity Cube
 # File:       code.py
 # Author:     Stephan Zehrer
-# Version :    1.0
+# Version:   1.3 beta
 #
 # Original: 2019 Kattni Rembor for Adafruit Industries
 # SPDX-License-Identifier: GPL-3.0-only
@@ -22,6 +22,7 @@
 #
 # -----------------------------------------------------------------------------
 
+
 import board
 import neopixel
 import microcontroller
@@ -40,11 +41,17 @@ from adafruit_bluefruit_connect.packet import Packet
 from adafruit_bluefruit_connect.color_packet import ColorPacket
 from adafruit_bluefruit_connect.button_packet import ButtonPacket
 
-from button_color_cycler import ButtonColorCycler
+from button_detector import ButtonDetector
+from mode_controller import ModeController
+from simple_kv_storage import SimpleKVStorage
 
+
+# -----------------------------------------------------------------------------
+# Info
+# -----------------------------------------------------------------------------
 
 print("Adafruit CircuitPython 10.0.3")
-print("InfinityCube Lite V1.1")
+print("InfinityCube V1.3 beta")
 print("(c) 2025 by Stephan Zehrer")
 print("Adafruit ItsyBitsy nRF52840")
 
@@ -53,92 +60,192 @@ uid_hex = "".join(f"{b:02X}" for b in uid)
 print("UID:", uid_hex)
 
 
+# -----------------------------------------------------------------------------
+# Hardware config
+# -----------------------------------------------------------------------------
+
 # The number of NeoPixels in the externally attached strip
 # If using two strips connected to the same pin, count only one strip for this number!
 STRIP_PIXEL_NUMBER = 132
 PIXEL_PIN = board.D5  # data pin
 BUTTON_PIN = board.D10  # your button/sensor on pin 10
 
+# Create the NeoPixel strip
+strip_pixels = neopixel.NeoPixel(
+    PIXEL_PIN,
+    STRIP_PIXEL_NUMBER,
+    auto_write=False
+)
+
+
+# -----------------------------------------------------------------------------
+# Animations
+# -----------------------------------------------------------------------------
+
 # Setup for comet animation
 COMET_SPEED = 0.05  # Lower numbers increase the animation speed
 STRIP_COMET_TAIL_LENGTH = 10  # The length of the comet on the NeoPixel strip
 STRIP_COMET_BOUNCE = False  # Set to False to stop comet from "bouncing" on NeoPixel strip
 
+
 # Setup for sparkle animation
 SPARKLE_SPEED = 0.2  # Lower numbers increase the animation speed
 
-# Create the NeoPixel strip
-strip_pixels = neopixel.NeoPixel(board.D5, STRIP_PIXEL_NUMBER, auto_write=False)
 
-# Setup BLE connection
-ble = BLERadio()
-uart = UARTService()
-advertisement = ProvideServicesAdvertisement(uart)
-
-# Setup animations
 animations = AnimationSequence(
     AnimationGroup(
         SparklePulse(strip_pixels, SPARKLE_SPEED, color.TEAL)
     ),
     AnimationGroup(
-        Comet(strip_pixels, COMET_SPEED, color.TEAL, tail_length=STRIP_COMET_TAIL_LENGTH,
-              bounce=STRIP_COMET_BOUNCE)
+        Comet(
+            strip_pixels,
+            COMET_SPEED,
+            color.TEAL,
+            tail_length=STRIP_COMET_TAIL_LENGTH,
+            bounce=STRIP_COMET_BOUNCE,
+        )
     ),
 )
 
 animation_color = None
-mode = 0
 blanked = False
 
-COLORS = [
-    (0, 200, 150),   # teal-ish
-    (200, 40, 200),  # purple
-    (255, 120, 0),   # warm orange
-]
 
-button = ButtonColorCycler(
-    BUTTON_PIN,
-    COLORS,
-    debounce_s=0.08,
-    pressed_level=True,   # pressed when HIGH (active-high sensor)
+COLORS = [
+    (0, 200, 150),   # teal
+    (200, 40, 200),  # purple
+    (255, 120, 0),   # orange
+]
+color_idx = 0
+
+
+# -----------------------------------------------------------------------------
+# BLE
+# -----------------------------------------------------------------------------
+
+ble = BLERadio()
+uart = UARTService()
+advertisement = ProvideServicesAdvertisement(uart)
+
+
+# -----------------------------------------------------------------------------
+# Storage + Modes
+# -----------------------------------------------------------------------------
+
+storage = SimpleKVStorage("/settings.toml")
+
+
+def on_mode_change(mode):
+    print("Mode:", mode)
+
+
+def on_pairing_tick(seconds_left):
+    print("Pairing:", int(seconds_left), "s")
+    # TODO: LED countdown anzeigen
+
+
+def on_shelly_found(addr, adv):
+    print("Shelly paired:", addr)
+
+
+modes = ModeController(
+    ble=ble,
+    storage=storage,
+    remote_adv=advertisement,
+    pairing_s=10.0,
+    on_mode=on_mode_change,
+    on_tick=on_pairing_tick,
+    on_shelly=on_shelly_found,
 )
 
+def pretty_shelly_id(addr):
+    # addr z.B. "aa:bb:cc:dd:ee:ff" -> "DD:EE:FF" als kurze ID
+    if not addr:
+        return None
+    parts = addr.split(":")
+    if len(parts) >= 3:
+        return ":".join(p.upper() for p in parts[-3:])
+    return addr.upper()
+
+print("Startup mode:", modes.mode_name())
+
+if getattr(modes, "shelly_addr", None):
+    print("Shelly:", modes.shelly_addr.upper(), "| ID:", pretty_shelly_id(modes.shelly_addr))
+else:
+    print("Shelly: (none)")
+
+
+# -----------------------------------------------------------------------------
+# Button
+# -----------------------------------------------------------------------------
+
+button = ButtonDetector(
+    BUTTON_PIN,
+    debounce_s=0.08,
+    pressed_level=True,
+)
+
+
+# -----------------------------------------------------------------------------
+# Remote packet handling
+# -----------------------------------------------------------------------------
+
+remote_color_mode = 0  # 0 = changing, 1 = frozen
+
+
+def handle_remote_packet(packet):
+    global animation_color, remote_color_mode
+
+    if isinstance(packet, ColorPacket):
+        if remote_color_mode == 0:
+            animations.color = packet.color
+            animation_color = packet.color
+            print("Color:", packet.color)
+        else:
+            animations.color = animation_color
+
+    elif isinstance(packet, ButtonPacket) and packet.pressed:
+        if packet.button == ButtonPacket.LEFT:
+            animations.next()
+            print("Animation changed")
+
+        elif packet.button == ButtonPacket.RIGHT:
+            remote_color_mode = (remote_color_mode + 1) % 2
+            print("Color mode:", remote_color_mode)
+
+
+# -----------------------------------------------------------------------------
+# Main loop
+# -----------------------------------------------------------------------------
+
 while True:
-    ble.start_advertising(advertisement)  # Start advertising.
-    was_connected = False
-    while not was_connected or ble.connected:
+    ev = button.update()
+
+    if ev == ButtonDetector.SHORT:
+        color_idx = (color_idx + 1) % len(COLORS)
+        animations.color = COLORS[color_idx]
+        animation_color = COLORS[color_idx]
+        print("Local button color:", COLORS[color_idx])
+
+    elif ev == ButtonDetector.LONG_HELD:
+        modes.handle_long_press_3s()
+
+    if not blanked:
+        animations.animate()
+
+    if modes.mode == ModeController.REMOTE and ble.connected:
+        if uart.in_waiting:
+            try:
+                packet = Packet.from_stream(uart)
+            except ValueError:
+                pass
+            else:
+                handle_remote_packet(packet)
+
+    modes.update()
     
-    	if button.update():
-        	animations.color = button.color
-        	animation_color = button.color
-        	print("Button color:", button.color)
-    
-        if not blanked:  # If LED-off signal is not being sent...
-            animations.animate()  # Run the animations.
-        if ble.connected:  # If BLE is connected...
-            was_connected = True
-            if uart.in_waiting:  # Check to see if any data is available.
-                try:
-                    packet = Packet.from_stream(uart)  # Create the packet object.
-                except ValueError:
-                    continue
-                if isinstance(packet, ColorPacket):  # If the packet is color packet...
-                    if mode == 0:  # And mode is 0...
-                        animations.color = packet.color  # Update the animation to the color.
-                        print("Color:", packet.color)
-                        animation_color = packet.color  # Keep track of the current color...
-                    elif mode == 1:  # Because if mode is 1...
-                        animations.color = animation_color  # Freeze the animation color.
-                        print("Color:", animation_color)
-                elif isinstance(packet, ButtonPacket):  # If the packet is a button packet...
-                    if packet.pressed:  # If the buttons in the app are pressed...
-                        if packet.button == ButtonPacket.LEFT:  # If left arrow is pressed...
-                            print("A pressed: animation mode changed.")
-                            animations.next()  # Change to the next animation.
-                        elif packet.button == ButtonPacket.RIGHT:  # If right arrow is pressed...
-                            mode += 1  # Increase the mode by 1.
-                            if mode == 1:  # If mode is 1, print the following:
-                                print("Right pressed: color frozen!")
-                            if mode > 1:  # If mode is > 1...
-                                mode = 0  # Set mode to 0, and print the following:
-                                print("Right pressed: color changing!")
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+

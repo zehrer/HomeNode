@@ -1,4 +1,5 @@
 # simple_sparkle.py
+# Version 1.1
 #
 # Soft sparkle animation with fading background.
 # RAM-friendly, no adafruit_led_animation dependency.
@@ -9,59 +10,47 @@
 import time
 import random
 
-
 class SimpleSparkle:
-    def __init__(
-        self,
-        pixel_object,
-        color=(255, 255, 255),
-        speed=0.02,
-        sparkles_per_frame=3,
-        fade=220,
-        highlight=40,
-    ):
+    def __init__(self, pixel_object, speed=0.2, color=(0, 200, 150), fade=220, sparkles_per_frame=3, highlight=40):
         self.pixels = pixel_object
-        self.color = color
         self.speed = speed
-        self.sparkles_per_frame = int(max(1, sparkles_per_frame))
-        self.fade = int(min(255, max(0, fade)))
-        self.highlight = int(min(255, max(0, highlight)))
+        self._color = color
+        self.fade = fade
+        self.sparkles_per_frame = sparkles_per_frame
+        self.highlight = highlight
+        self._last = 0.0
 
-        self.num_pixels = len(self.pixels)
-        self._last_step = time.monotonic()
+    @property
+    def color(self):
+        return self._color
 
-    def _dim_all(self):
-        f = self.fade
-        for i in range(self.num_pixels):
+    @color.setter
+    def color(self, c):
+        self._color = c
+
+    def _fade_all(self):
+        f = self.fade / 255.0
+        for i in range(len(self.pixels)):
             r, g, b = self.pixels[i]
-            if r or g or b:
-                self.pixels[i] = (
-                    (r * f) // 255,
-                    (g * f) // 255,
-                    (b * f) // 255,
-                )
+            self.pixels[i] = (int(r * f), int(g * f), int(b * f))
 
     def _add_sparkle(self):
-        i = random.randrange(self.num_pixels)
-
-        r, g, b = self.color
-        h = self.highlight
-
-        self.pixels[i] = (
-            255 if (r + h) > 255 else (r + h),
-            255 if (g + h) > 255 else (g + h),
-            255 if (b + h) > 255 else (b + h),
-        )
+        i = random.randrange(len(self.pixels))
+        r, g, b = self._color
+        r = min(255, r + self.highlight)
+        g = min(255, g + self.highlight)
+        b = min(255, b + self.highlight)
+        self.pixels[i] = (r, g, b)
 
     def animate(self):
         now = time.monotonic()
-        if (now - self._last_step) < self.speed:
-            return
-        self._last_step = now
+        if (now - self._last) < self.speed:
+            return False
+        self._last = now
 
-        self._dim_all()
-
+        self._fade_all()
         for _ in range(self.sparkles_per_frame):
             self._add_sparkle()
 
         self.pixels.show()
+        return True
