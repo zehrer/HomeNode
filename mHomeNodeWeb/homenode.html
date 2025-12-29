@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Shelly Web Bluetooth – Geräte auswählen & GATT testen</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    button, input { padding: 10px 14px; margin-right: 8px; margin-bottom: 8px; }
+    button { cursor: pointer; }
+    code, pre { background: #f4f4f6; padding: 2px 6px; border-radius: 6px; }
+    pre { padding: 12px; overflow: auto; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-top: 14px; }
+    .muted { opacity: .75; }
+    .ok { color: #0a7a2f; }
+    .err { color: #b00020; }
+    ul { padding-left: 18px; }
+    li { margin: 6px 0; }
+    .pill { display:inline-block; border:1px solid #ddd; border-radius:999px; padding:2px 10px; margin:2px 6px 2px 0; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Shelly Web Bluetooth (Chrome) – Auswahl & GATT</h1>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnPick">Shelly Gerät auswählen…</button>
+      <button id="btnConnect" disabled>Verbinden (GATT)</button>
+      <button id="btnDisconnect" disabled>Trennen</button>
+      <label class="muted">
+        <input type="checkbox" id="chkEnumerate" checked />
+        nach Connect: Services/Characteristics listen
+      </label>
+    </div>
+
+    <div class="muted">
+      <div><b>Hinweis:</b> Der Auswahldialog ist von Chrome. Diese Seite kann ihn nur öffnen und danach mit dem gewählten Gerät arbeiten.</div>
+      <div>Für Shelly BLU Button ist GATT oft nur im <b>Config/Pairing-Mode</b> aktiv (z. B. Taste länger drücken bis anderes Blinken).</div>
+    </div>
+
+    <div id="status" class="muted" style="margin-top:10px;">Status: Bereit</div>
+  </div>
+
+  <div class="card">
+    <h2>Filter (Shelly-only, leicht erweiterbar)</h2>
+    <div class="muted">Name-Prefixe, die im Chrome-Dialog zugelassen sind:</div>
+    <div id="prefixPills" style="margin:8px 0;"></div>
+
+    <div class="row">
+      <input id="prefixInput" type="text" placeholder="Prefix hinzufügen (z.B. SBBT)" />
+      <button id="btnAddPrefix">+ Prefix</button>
+      <button id="btnResetPrefixes">Reset</button>
+    </div>
+
+    <div class="muted" style="margin-top:6px;">
+      Optional Services (für spätere Service-Reads erlaubt):
+      <span id="svcPills"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Ausgewähltes Gerät</h2>
+    <ul id="deviceList"></ul>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+<script>
+(() => {
+  // ========= 1) Zentrale, leicht erweiterbare Config =========
+  const CONFIG = {
+    // Nur Shelly: typische Präfixe (erweiterbar)
+    // - "Shelly" (manche Geräte werben so)
+    // - "SBBT" (Shelly BLU Button1/2 model id wie SBBT-002C)
+    // Ergänze später z.B. weitere Shelly-BLU Modelle, sobald du Namen siehst.
+    namePrefixes: ["Shelly", "SBBT"],
+
+    // Optional Services: damit darfst du nach dem Connect diese Services lesen.
+    // (Ohne das bekommst du oft PermissionErrors bei getPrimaryServices(UUID).)
+    optionalServices: ["battery_service", "device_information"],
+
+    // Connect Timeout (ms): damit die UI nicht ewig "hängt"
+    connectTimeoutMs: 8000,
+  };
+
+  // ========= 2) UI / State =========
+  const btnPick = document.getElementById('btnPick');
+  const btnConnect = document.getElementById('btnConnect');
+  const btnDisconnect = document.getElementById('btnDisconnect');
+  const chkEnumerate = document.getElementById('chkEnumerate');
+
+  const prefixPills = document.getElementById('prefixPills');
+  const prefixInput = document.getElementById('prefixInput');
+  const btnAddPrefix = document.getElementById('btnAddPrefix');
+  const btnResetPrefixes = document.getElementById('btnResetPrefixes');
+  const svcPills = document.getElementById('svcPills');
+
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const deviceListEl = document.getElementById('deviceList');
+
+  /** @type {BluetoothDevice|null} */
+  let selectedDevice = null;
+  /** @type {BluetoothRemoteGATTServer|null} */
+  let gattServer = null;
+
+  function setStatus(msg, cls) {
+    statusEl.className = cls ? cls : "muted";
+    statusEl.textContent = "Status: " + msg;
+  }
+  function log(...args) {
+    logEl.textContent += args.map(a => (typeof a === "string" ? a : JSON.stringify(a, null, 2))).join(" ") + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function clearLog() { logEl.textContent = ""; }
+  function supportsWebBluetooth() { return !!navigator.bluetooth; }
+
+  function renderPills() {
+    prefixPills.innerHTML = "";
+    CONFIG.namePrefixes.forEach(p => {
+      const span = document.createElement("span");
+      span.className = "pill";
+      span.textContent = p;
+      prefixPills.appendChild(span);
+    });
+
+    svcPills.innerHTML = "";
+    CONFIG.optionalServices.forEach(s => {
+      const span = document.createElement("span");
+      span.className = "pill";
+      span.textContent = s;
+      svcPills.appendChild(span);
+    });
+  }
+
+  function addDeviceToList(device) {
+    deviceListEl.innerHTML = "";
+    const li = document.createElement("li");
+    li.innerHTML = `
+      <b>${device.name || "(kein Name)"}</b>
+      <div class="muted">id: <code>${device.id}</code></div>
+      <div class="muted">gatt: <code>${device.gatt ? "ja" : "nein"}</code></div>
+      <div class="muted">connected: <code>${device.gatt?.connected ? "ja" : "nein"}</code></div>
+    `;
+    deviceListEl.appendChild(li);
+  }
+
+  function buildRequestOptionsShellyOnly() {
+    // Nur Filter, kein acceptAllDevices.
+    // Chrome zeigt nur Geräte an, die zu mindestens einem Filter passen.
+    const filters = CONFIG.namePrefixes.map(prefix => ({ namePrefix: prefix }));
+    return {
+      filters,
+      optionalServices: CONFIG.optionalServices
+    };
+  }
+
+  async function pickDevice() {
+    if (!supportsWebBluetooth()) {
+      setStatus("Web Bluetooth nicht verfügbar (Chrome + HTTPS/localhost nötig).", "err");
+      return;
+    }
+
+    clearLog();
+    setStatus("Öffne Chrome Geräteauswahl…", "muted");
+    log("Öffne Chrome Geräteauswahl (Shelly-only Filter)…");
+    log("Filters:", CONFIG.namePrefixes);
+
+    try {
+      const device = await navigator.bluetooth.requestDevice(buildRequestOptionsShellyOnly());
+      selectedDevice = device;
+      addDeviceToList(device);
+
+      setStatus(`Ausgewählt: ${device.name || "(kein Name)"}`, "ok");
+      log("Ausgewählt:", { name: device.name, id: device.id });
+
+      device.addEventListener("gattserverdisconnected", () => {
+        setStatus("Getrennt.", "err");
+        btnConnect.disabled = !selectedDevice;
+        btnDisconnect.disabled = true;
+        gattServer = null;
+        addDeviceToList(selectedDevice);
+      });
+
+      btnConnect.disabled = false;
+    } catch (err) {
+      setStatus("Abgebrochen oder Fehler beim Auswählen.", "err");
+      log("requestDevice error:", String(err));
+    }
+  }
+
+  function withTimeout(promise, ms, label) {
+    let t;
+    const timeout = new Promise((_, reject) => {
+      t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+  }
+
+  async function connectAndMaybeEnumerate() {
+    if (!selectedDevice) return;
+
+    try {
+      setStatus("Verbinde (GATT)…", "muted");
+      log("Verbinde zu GATT… (Tipp: Shelly BLU Button oft nur im Config/Pairing-Mode!)");
+
+      gattServer = await withTimeout(selectedDevice.gatt.connect(), CONFIG.connectTimeoutMs, "GATT connect");
+
+      setStatus("Verbunden.", "ok");
+      btnConnect.disabled = true;
+      btnDisconnect.disabled = false;
+      addDeviceToList(selectedDevice);
+
+      if (!chkEnumerate.checked) return;
+
+      // Services listen (kann 0 sein, wenn Gerät keinen GATT-Server in diesem Modus anbietet)
+      const services = await gattServer.getPrimaryServices();
+      log(`Primary Services: ${services.length}`);
+
+      for (const svc of services) {
+        log("Service:", svc.uuid);
+        const chars = await svc.getCharacteristics();
+        log(`  Characteristics: ${chars.length}`);
+        for (const ch of chars) {
+          // properties ist ein Objekt mit booleans, das so okay geloggt werden kann
+          log("   -", ch.uuid, "props:", ch.properties);
+        }
+      }
+
+      if (services.length === 0) {
+        log("Hinweis: 0 Services. Sehr oft ist der Button dann NICHT im Config/Pairing-Mode.");
+      }
+    } catch (err) {
+      setStatus("Fehler beim Verbinden.", "err");
+      log("connect/enumerate error:", String(err));
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      gattServer = null;
+      addDeviceToList(selectedDevice);
+    }
+  }
+
+  async function disconnect() {
+    if (selectedDevice?.gatt?.connected) {
+      selectedDevice.gatt.disconnect();
+    }
+    setStatus("Getrennt.", "err");
+    btnConnect.disabled = !selectedDevice;
+    btnDisconnect.disabled = true;
+    gattServer = null;
+    addDeviceToList(selectedDevice);
+  }
+
+  function addPrefix() {
+    const p = (prefixInput.value || "").trim();
+    if (!p) return;
+    if (!CONFIG.namePrefixes.includes(p)) CONFIG.namePrefixes.push(p);
+    prefixInput.value = "";
+    renderPills();
+  }
+
+  function resetPrefixes() {
+    CONFIG.namePrefixes = ["Shelly", "SBBT"];
+    renderPills();
+  }
+
+  // ========= 3) Wire up =========
+  btnPick.addEventListener("click", pickDevice);
+  btnConnect.addEventListener("click", connectAndMaybeEnumerate);
+  btnDisconnect.addEventListener("click", disconnect);
+  btnAddPrefix.addEventListener("click", addPrefix);
+  prefixInput.addEventListener("keydown", (e) => { if (e.key === "Enter") addPrefix(); });
+  btnResetPrefixes.addEventListener("click", resetPrefixes);
+
+  renderPills();
+
+  if (!supportsWebBluetooth()) {
+    setStatus("Web Bluetooth nicht verfügbar. Nutze Chrome + HTTPS (oder localhost).", "err");
+  } else {
+    setStatus("Bereit (Shelly-only Filter aktiv).", "muted");
+  }
+})();
+</script>
+</body>
+</html>
